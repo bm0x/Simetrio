@@ -220,14 +220,3 @@ Development notes for contributors
 - When editing the TUI prefer stable textual APIs. Different textual versions changed minor CSS/constructor behavior; avoid using nonstandard `App(title=...)` kwargs or undefined CSS variables.
 - If you add more clipboard-related features, consider using a small cross-platform library (pyperclip) to simplify fallbacks.
 
-Contact and next steps
-----------------------
-If you want I can:
-- Add keyboard shortcuts (e.g., `c` to copy log, `q` to quit) and a small toast notification when copying succeeds.
-- Change the temp-file fallback location to `build/logs/simetrio-copies/` and retain a few historic copies for easier retrieval.
-- Expand the troubleshooting section with exact multipass/qemu command snippets and example outputs for common failures.
-
-License & attribution
----------------------
-Follow the repository's top-level licensing and contribution rules.
-
