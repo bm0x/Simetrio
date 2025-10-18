@@ -28,24 +28,43 @@ import tempfile
 from pathlib import Path
 
 try:
-    from textual.app import App, ComposeResult
-    from textual.widgets import Header, Footer, Button, Static, Input, Checkbox, TextLog
-    from textual.containers import Horizontal, Vertical
-    from textual.reactive import var
+    from textual.app import App, ComposeResult  # type: ignore[import]
+    from textual.widgets import Header, Footer, Button, Static, Input, Checkbox, TextLog  # type: ignore[import]
+    from textual.containers import Horizontal, Vertical  # type: ignore[import]
+    from textual.reactive import var  # type: ignore[import]
 except Exception:
     print("Textual is not installed. Install dependencies with:")
     print("  python3 -m pip install -r scripts/requirements-simetrio.txt")
     sys.exit(1)
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = REPO_ROOT / 'scripts'
+def find_repo_root():
+    p = Path(__file__).resolve()
+    cur = p.parent
+    # walk upwards until we find README.md or reach filesystem root
+    while cur != cur.parent:
+        if (cur / 'README.md').exists():
+            return cur
+        cur = cur.parent
+    return p.parent
+
+
+REPO_ROOT = find_repo_root()
+# Prefer 'bin' for executable scripts; fall back to 'scripts' for compatibility
+if (REPO_ROOT / 'bin').exists():
+    SCRIPTS_DIR = REPO_ROOT / 'bin'
+else:
+    SCRIPTS_DIR = REPO_ROOT / 'scripts'
 
 # Helper to ensure scripts exist
 def script_path(name):
     p = SCRIPTS_DIR / name
-    if not p.exists():
-        raise FileNotFoundError(f"Required script not found: {p}")
-    return str(p)
+    # Prefer scripts/ but fall back to repo root for top-level executables
+    if p.exists():
+        return str(p)
+    alt = REPO_ROOT / name
+    if alt.exists():
+        return str(alt)
+    raise FileNotFoundError(f"Required script not found: {p} or {alt}")
 
 class Menu(Static):
     pass
@@ -89,6 +108,7 @@ class SimetrioApp(App):
                 yield Button("Clean", id="clean")
                 yield Button("Stop noVNC", id="stop")
                 yield Button("Preflight check", id="check")
+                yield Button("Deps check", id="deps")
                 yield Button("Quit", id="quit")
             with Vertical(id="right", classes="panel"):
                 yield Static("Parameters", id="params_title")
@@ -98,6 +118,8 @@ class SimetrioApp(App):
                 yield Input(placeholder="Disk (e.g. 20G)", id="disk")
                 yield Checkbox(label="Install KDE", id="kde")
                 yield Checkbox(label="Install Calamares", id="calamares")
+                yield Checkbox(label="Install Python reqs", id="install_python")
+                yield Checkbox(label="Install as admin (sudo)", id="elevate")
                 yield Button("Run Selected", id="run_selected")
                 yield Button("Copy Log", id="copy_log")
             with Vertical(id="log", classes="panel"):
@@ -111,7 +133,7 @@ class SimetrioApp(App):
         if btn_id == 'quit':
             self.exit()
             return
-        if btn_id in ('build','novnc','clean','stop','check'):
+        if btn_id in ('build','novnc','clean','stop','check','deps'):
             # mark which action to run; show selection in log
             self.action = btn_id
             self._append_log(f"Selected action: {btn_id}")
@@ -119,8 +141,23 @@ class SimetrioApp(App):
                 # prompt for image path via input focus
                 self.query_one('#inst_name').value = ''
                 self.query_one('#inst_name').placeholder = 'Image path (e.g. build/Stralyx/output/debian-smoke.img)'
+            elif btn_id == 'deps':
+                # run dependency flow in background to stream output and detect missing packages
+                t = threading.Thread(target=self.action_deps_flow, daemon=True)
+                t.start()
             else:
                 self.query_one('#inst_name').placeholder = 'Instance name (default: stralyx)'
+        elif btn_id == 'relaunch':
+            # Relaunch top-level simetrio CLI (detached)
+            try:
+                cmd = [sys.executable, script_path('simetrio')]
+                self._append_log('Relaunching: ' + ' '.join(cmd))
+                subprocess.Popen(cmd)
+                self._append_log('Simetrio relaunched in background; exiting TUI.')
+                self.exit()
+            except Exception as e:
+                self._append_log(f'Relaunch failed: {e}')
+            return
         elif btn_id == 'copy_log':
             # copy the internal log buffer to clipboard (or file fallback)
             try:
@@ -147,7 +184,17 @@ class SimetrioApp(App):
         disk = self.query_one('#disk').value.strip() or '20G'
         kde = self.query_one('#kde').value
         cal = self.query_one('#calamares').value
-        return dict(name=name, mem=mem, cpus=cpus, disk=disk, kde=kde, calamares=cal)
+        install_python = False
+        try:
+            install_python = self.query_one('#install_python').value
+        except Exception:
+            install_python = False
+        elevate = False
+        try:
+            elevate = self.query_one('#elevate').value
+        except Exception:
+            elevate = False
+        return dict(name=name, mem=mem, cpus=cpus, disk=disk, kde=kde, calamares=cal, install_python=install_python, elevate=elevate)
 
     def _run_action(self, action, params):
         if self.running:
@@ -177,15 +224,27 @@ class SimetrioApp(App):
             elif action == 'stop':
                 cmd = [script_path('stop-novnc.sh')]
             elif action == 'check':
-                cmd = [script_path('simetrio'), 'check']
+                # Ensure we invoke the Python entrypoint with the current interpreter
+                cmd = [sys.executable, script_path('simetrio'), 'check']
+            elif action == 'deps':
+                # run simetrio deps; invoke with sys.executable to avoid permission issues
+                if params.get('install_python'):
+                    cmd = [sys.executable, script_path('simetrio'), 'deps', '--install-python']
+                else:
+                    cmd = [sys.executable, script_path('simetrio'), 'deps']
+                if params.get('elevate'):
+                    cmd.append('--elevate')
             else:
                 self.call_from_thread(self._append_log, f'Unknown action: {action}')
                 return
 
             # ensure executable
             try:
-                for p in cmd[:1]:
-                    Path(p).chmod(Path(p).stat().st_mode | 0o111)
+                # Only attempt to chmod repository scripts, never the Python interpreter
+                first = cmd[0]
+                fp = Path(first)
+                if fp.exists() and str(fp) != str(Path(sys.executable)):
+                    fp.chmod(fp.stat().st_mode | 0o111)
             except Exception:
                 pass
 
@@ -252,6 +311,31 @@ class SimetrioApp(App):
         with open(fd, 'w') as f:
             f.write(data)
         self._append_log(f'Clipboard utilities not found; log written to: {path}')
+
+    # -- additional UI helpers -----------------------------------------
+    def action_deps_flow(self):
+        """Interactive deps flow: run deps check and ask user to install python reqs if missing."""
+        # run check first
+        self._append_log('Starting dependency check...')
+        proc = subprocess.Popen([sys.executable, script_path('simetrio'), 'deps'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out = ''
+        for line in proc.stdout:
+            out += line
+            self.call_from_thread(self._append_log, line.rstrip())
+        proc.wait()
+        if proc.returncode == 0:
+            self.call_from_thread(self._append_log, 'All dependencies satisfied.')
+            return
+        # If missing python packages, offer to install
+        if 'Missing Python packages' in out:
+            # prompt user via log & placeholder action
+            self.call_from_thread(self._append_log, 'Missing Python packages detected. Click "Run Selected" to install (set Install KDE/Calamares checkbox as confirm).')
+            # set a flag so run_selected will run install path
+            self._pending_deps_install = True
+        else:
+            self.call_from_thread(self._append_log, 'Some binaries are missing; please install them manually and re-run.')
+
+    # Note: deps flow is started in the primary on_button_pressed handler above.
 
 if __name__ == '__main__':
     # run the textual app; if terminal is too small textual will warn

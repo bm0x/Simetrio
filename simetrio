@@ -19,11 +19,29 @@ import os
 import shutil
 import subprocess
 import sys
+import os
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = REPO_ROOT / 'scripts'
+def find_repo_root():
+    p = Path(__file__).resolve()
+    cur = p.parent
+    # walk upwards until we find README.md or reach filesystem root
+    while cur != cur.parent:
+        if (cur / 'README.md').exists():
+            return cur
+        cur = cur.parent
+    return p.parent
+
+
+REPO_ROOT = find_repo_root()
+# Prefer 'bin' for executable scripts (new layout). Fall back to 'scripts' for
+# older layout compatibility.
+if (REPO_ROOT / 'bin').exists():
+    SCRIPTS_DIR = REPO_ROOT / 'bin'
+else:
+    SCRIPTS_DIR = REPO_ROOT / 'scripts'
 
 # Helper functions
 
@@ -48,6 +66,71 @@ def run_cmd(cmd, cwd=None, env=None, stream=True, dry=False):
     except FileNotFoundError:
         print(f"Command not found: {cmd[0]}", file=sys.stderr)
         return 127
+
+
+def check_python_requirements(req_path=None):
+    """Check Python packages listed in a requirements file are importable.
+    Returns list of missing package names."""
+    if req_path is None:
+        # prefer scripts/requirements-simetrio.txt then repo root
+        r1 = REPO_ROOT / 'scripts' / 'requirements-simetrio.txt'
+        r2 = REPO_ROOT / 'requirements-simetrio.txt'
+        reqf = r1 if r1.exists() else (r2 if r2.exists() else None)
+    else:
+        reqf = Path(req_path)
+    missing = []
+    if not reqf or not reqf.exists():
+        return missing
+    with open(reqf, 'r') as rf:
+        for line in rf:
+            pkg = line.strip()
+            if not pkg or pkg.startswith('#'):
+                continue
+            # take package name before extras/version
+            name = pkg.split('==')[0].split('>=')[0].split('[')[0].strip()
+            # try to import common module name
+            modname = name.replace('-', '_')
+            try:
+                importlib.import_module(modname)
+            except Exception:
+                missing.append(name)
+    return missing
+
+
+def install_python_requirements(req_path=None):
+    if req_path is None:
+        r1 = REPO_ROOT / 'scripts' / 'requirements-simetrio.txt'
+        r2 = REPO_ROOT / 'requirements-simetrio.txt'
+        reqf = r1 if r1.exists() else (r2 if r2.exists() else None)
+    else:
+        reqf = Path(req_path)
+    if not reqf or not reqf.exists():
+        print('No requirements file found to install.')
+        return 1
+    cmd = [sys.executable, '-m', 'pip', 'install', '-r', str(reqf)]
+    return run_cmd(cmd, cwd=REPO_ROOT, stream=True)
+
+
+def install_python_requirements_elevated(req_path=None):
+    """Attempt to install requirements with elevated privileges on POSIX using sudo.
+    On Windows this will return an error and instruct the user to run an elevated shell.
+    """
+    if req_path is None:
+        r1 = REPO_ROOT / 'scripts' / 'requirements-simetrio.txt'
+        r2 = REPO_ROOT / 'requirements-simetrio.txt'
+        reqf = r1 if r1.exists() else (r2 if r2.exists() else None)
+    else:
+        reqf = Path(req_path)
+    if not reqf or not reqf.exists():
+        print('No requirements file found to install.')
+        return 1
+    if os.name == 'nt':
+        print('Elevated installation on Windows is not automated. Please open an Administrator PowerShell and run:')
+        print(f"{sys.executable} -m pip install -r {reqf}")
+        return 2
+    # POSIX: prefix with sudo
+    cmd = ['sudo', sys.executable, '-m', 'pip', 'install', '-r', str(reqf)]
+    return run_cmd(cmd, cwd=REPO_ROOT, stream=True)
 
 
 def check_scripts_syntax():
@@ -164,6 +247,30 @@ def cmd_check(args):
     return 1
 
 
+def cmd_deps(args):
+    """Run dependency checks and optionally install Python requirements."""
+    missing_bins = [b for b in ('multipass','qemu-system-x86_64','python3') if which_bin(b) is None]
+    if missing_bins:
+        print('Missing binaries: ' + ', '.join(missing_bins))
+    else:
+        print('All required binaries present.')
+
+    missing_pkgs = check_python_requirements()
+    if missing_pkgs:
+        print('Missing Python packages: ' + ', '.join(missing_pkgs))
+        if args.install_python:
+            print('Installing Python requirements...')
+            if getattr(args, 'elevate', False):
+                rc = install_python_requirements_elevated()
+            else:
+                rc = install_python_requirements()
+            return rc
+        return 2
+    else:
+        print('Python requirements satisfied.')
+    return 0
+
+
 def main(argv=None):
     # If invoked without args, start interactive TUI
     if argv is None:
@@ -171,7 +278,12 @@ def main(argv=None):
 
     if len(argv) == 0:
         # Prefer the full-screen Textual TUI if available
+        # locate the TUI script: prefer scripts/ but fall back to repo root
         tui_script = SCRIPTS_DIR / 'simetrio_tui.py'
+        if not tui_script.exists():
+            alt = REPO_ROOT / 'simetrio_tui.py'
+            if alt.exists():
+                tui_script = alt
         try:
             import textual  # type: ignore
             have_textual = True
@@ -179,22 +291,47 @@ def main(argv=None):
             have_textual = False
 
         if not have_textual and tui_script.exists():
-            # Offer to install requirements
+            # Offer to install requirements and report clearly; then attempt to import
             if sys.stdin.isatty():
                 ans = input('Textual not found. Install UI deps now? (requires pip) [y/N]: ').strip().lower()
                 if ans == 'y':
-                    reqs = SCRIPTS_DIR / 'requirements-simetrio.txt'
-                    if reqs.exists():
-                        rc = subprocess.call([sys.executable, '-m', 'pip', 'install', '-r', str(reqs)])
-                        if rc == 0:
+                    # Find requirements file either in scripts/ or repo root
+                    r1 = SCRIPTS_DIR / 'requirements-simetrio.txt'
+                    r2 = REPO_ROOT / 'requirements-simetrio.txt'
+                    reqs = r1 if r1.exists() else (r2 if r2.exists() else None)
+                    if reqs:
+                        print('Installing UI dependencies (this may require network access and privileges)...')
+                        rc = run_cmd([sys.executable, '-m', 'pip', 'install', '-r', str(reqs)], cwd=REPO_ROOT, stream=True)
+                        if rc != 0:
+                            print('Failed to install UI dependencies (pip returned non-zero). Aborting TUI launch.')
+                            return 1
+                        # try import again; if import fails, warn but attempt to
+                        # execv the TUI anyway — a fresh interpreter is more
+                        # likely to pick up newly installed site-packages.
+                        try:
+                            import textual  # type: ignore
+                            have_textual = True
+                        except Exception as e:
+                            print('Warning: Textual import failed after installation:', e)
+                            have_textual = False
+                        # If we're interactive, relaunch the TUI in-place so the
+                        # user is immediately dropped into the Textual interface.
+                        if sys.stdin.isatty():
                             try:
-                                import textual  # type: ignore
-                                have_textual = True
-                            except Exception:
-                                have_textual = False
+                                print('Launching TUI...')
+                                os.execv(sys.executable, [sys.executable, str(tui_script)])
+                            except Exception as e:
+                                print('Failed to execv relaunched TUI:', e)
+                                return 1
+                    else:
+                        print('Requirements file not found in scripts/ or repo root. Cannot install UI deps.')
+                        return 1
+                else:
+                    print('Textual not installed; skipping TUI. Exiting.')
+                    return 1
             else:
-                # non-interactive, don't auto-install
-                have_textual = False
+                print('Textual not available and non-interactive shell; cannot launch TUI. Exiting.')
+                return 1
 
         if have_textual and tui_script.exists():
             # Prefer interactive launch: if the user is at a terminal, run the TUI
@@ -231,9 +368,11 @@ def main(argv=None):
                         print(''.join(tail))
                 except Exception as e:
                     print('Failed to read log:', e)
-            return rc
+                return rc
 
-        return interactive_menu()
+            # If TUI script not available or textual not installed we exit instead of falling back to the legacy interactive menu
+            print('TUI not available; exiting.')
+            return 1
 
     parser = argparse.ArgumentParser(prog='simetrio', description='Simetrio — AIO build & test CLI for this repo')
     parser.add_argument('--dry', dest='dry', action='store_true', help='Print commands but do not execute')
@@ -258,6 +397,9 @@ def main(argv=None):
 
     sub.add_parser('stop', help='Stop running noVNC (qemu + websockify)')
     sub.add_parser('check', help='Run preflight checks (binaries + script syntax)')
+    p_deps = sub.add_parser('deps', help='Check dependencies and optionally install Python requirements')
+    p_deps.add_argument('--install-python', action='store_true', help='Install python requirements from requirements-simetrio.txt')
+    p_deps.add_argument('--elevate', action='store_true', help='Attempt to run pip install with elevated privileges (uses sudo on POSIX)')
 
     args = parser.parse_args(argv)
 
@@ -271,61 +413,10 @@ def main(argv=None):
         return cmd_stop(args)
     if args.cmd == 'check':
         return cmd_check(args)
+    if args.cmd == 'deps':
+        return cmd_deps(args)
 
     return 0
-
-
-def interactive_menu():
-    """Simple terminal UI: ask the user what to run and collect parameters interactively."""
-    try:
-        while True:
-            print('\nSimetrio — Interactive menu')
-            print('1) Build image (multipass)')
-            print('2) Run noVNC against image')
-            print('3) Clean build artifacts / remove instance')
-            print('4) Stop noVNC (qemu + websockify)')
-            print('5) Preflight checks')
-            print('6) Exit')
-            choice = input('Choose an option [1-6]: ').strip()
-            if choice == '1':
-                name = input('Instance name [stralyx]: ').strip() or 'stralyx'
-                mem = input('Memory [4G]: ').strip() or '4G'
-                cpus = input('CPUs [2]: ').strip() or '2'
-                disk = input('Disk [20G]: ').strip() or '20G'
-                with_kde = input('Install KDE? (y/N): ').strip().lower() == 'y'
-                with_calamares = input('Install Calamares? (y/N): ').strip().lower() == 'y'
-                dry = input('Dry run? (y/N): ').strip().lower() == 'y'
-                ns = SimpleNamespace(name=name, mem=mem, cpus=int(cpus), disk=disk, with_kde=with_kde, with_calamares=with_calamares, dry=dry)
-                rc = cmd_build(ns)
-                print('Return code:', rc)
-            elif choice == '2':
-                default_img = str(REPO_ROOT / 'build' / REPO_ROOT.name / 'output' / f'{REPO_ROOT.name}-smoke.img')
-                img = input(f'Image path [{default_img}]: ').strip() or default_img
-                dry = input('Dry run? (y/N): ').strip().lower() == 'y'
-                ns = SimpleNamespace(image=img, dry=dry)
-                rc = cmd_novnc(ns)
-                print('Return code:', rc)
-            elif choice == '3':
-                yes = input('Confirm delete build artifacts? (y/N): ').strip().lower() == 'y'
-                remove = input('Remove multipass instance? (y/N): ').strip().lower() == 'y'
-                instance = input('Instance name [stralyx]: ').strip() or 'stralyx'
-                ns = SimpleNamespace(yes=yes, remove_instance=remove, instance_name=instance, dry=False)
-                rc = cmd_clean(ns)
-                print('Return code:', rc)
-            elif choice == '4':
-                rc = cmd_stop(SimpleNamespace())
-                print('Return code:', rc)
-            elif choice == '5':
-                rc = cmd_check(SimpleNamespace())
-                print('Return code:', rc)
-            elif choice == '6' or choice.lower() in ('q','quit','exit'):
-                print('Exiting Simetrio.')
-                return 0
-            else:
-                print('Invalid choice, try again.')
-    except (EOFError, KeyboardInterrupt):
-        print('\nExiting Simetrio.')
-        return 0
 
 
 if __name__ == '__main__':
