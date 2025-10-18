@@ -116,15 +116,28 @@ class SimetrioApp(App):
                 yield Button("Quit", id="quit")
             with Vertical(id="right", classes="panel"):
                 yield Static("Parameters", id="params_title")
+                # Basic inputs always visible
                 yield Input(placeholder="Instance name (default: stralyx)", id="inst_name")
                 yield Input(placeholder="Memory (e.g. 4G)", id="mem")
                 yield Input(placeholder="CPUs (e.g. 2)", id="cpus")
                 yield Input(placeholder="Disk (e.g. 20G)", id="disk")
-                yield Checkbox(label="Install KDE", id="kde")
-                yield Checkbox(label="Install Calamares", id="calamares")
-                yield Checkbox(label="Install Python reqs", id="install_python")
-                yield Checkbox(label="Install as admin (sudo)", id="elevate")
-                yield Checkbox(label="Install system deps", id="install_system")
+
+                # Section toggles
+                yield Button("▸ Opcionales", id="toggle_optional")
+                with Vertical(id='section_optional'):
+                    yield Checkbox(label="Install KDE", id="kde")
+                    yield Checkbox(label="Install Calamares", id="calamares")
+
+                yield Button("▸ Python / UI", id="toggle_python")
+                with Vertical(id='section_python'):
+                    yield Checkbox(label="Install Python reqs", id="install_python")
+                    # UI deps could be added here in future
+
+                yield Button("▸ Sistema", id="toggle_system")
+                with Vertical(id='section_system'):
+                    yield Checkbox(label="Install as admin (sudo)", id="elevate")
+                    yield Checkbox(label="Install system deps", id="install_system")
+
                 yield Button("Run Selected", id="run_selected")
                 yield Button("Copy Log", id="copy_log")
             with Vertical(id="log", classes="panel"):
@@ -132,6 +145,35 @@ class SimetrioApp(App):
                 self.textlog = TextLog(highlight=True, wrap=True, id="textlog")
                 yield self.textlog
         yield Footer()
+
+    def on_mount(self) -> None:
+        """Initialize sections collapsed by default and set button labels."""
+        # Map buttons to section titles
+        mapping = {
+            'toggle_optional': ('section_optional', 'Opcionales'),
+            'toggle_python': ('section_python', 'Python / UI'),
+            'toggle_system': ('section_system', 'Sistema')
+        }
+        for btn_id, (sec_id, title) in mapping.items():
+            try:
+                btn = self.query_one(f'#{btn_id}', Button)
+                sec = self.query_one(f'#{sec_id}', Vertical)
+            except Exception:
+                continue
+            # collapse sections initially
+            try:
+                sec.visible = False
+            except Exception:
+                # hide children if container doesn't support visible
+                for c in list(sec.children):
+                    try:
+                        c.visible = False
+                    except Exception:
+                        pass
+            try:
+                btn.label = f'▸ {title}'
+            except Exception:
+                pass
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id
@@ -191,6 +233,20 @@ class SimetrioApp(App):
                 self._run_action(action, params)
             except Exception as e:
                 self._append_log(f'Error preparing action: {e}')
+        elif btn_id in ('toggle_optional','toggle_python','toggle_system'):
+            # Map button id to section container id
+            mapping = {
+                'toggle_optional': 'section_optional',
+                'toggle_python': 'section_python',
+                'toggle_system': 'section_system'
+            }
+            sec = mapping.get(btn_id)
+            if sec:
+                try:
+                    self._toggle_section(sec, btn_id)
+                except Exception as e:
+                    self._append_log(f'Failed to toggle section {sec}: {e}')
+            return
 
     def _gather_params(self):
         name = self.query_one('#inst_name').value.strip() or 'stralyx'
@@ -215,6 +271,53 @@ class SimetrioApp(App):
         except Exception:
             elevate = False
         return dict(name=name, mem=mem, cpus=cpus, disk=disk, kde=kde, calamares=cal, install_python=install_python, install_system=install_system, elevate=elevate)
+
+    def _toggle_section(self, section_id: str, btn_id: str):
+        """Toggle visibility of a section Vertical container and update the button label."""
+        try:
+            btn = self.query_one(f'#{btn_id}', Button)
+            sec = self.query_one(f'#{section_id}', Vertical)
+        except Exception:
+            # Textual may raise if not found; fallback to logging
+            self._append_log(f'Section or button not found: {section_id} / {btn_id}')
+            return
+        # Toggle container visibility directly when possible
+        try:
+            current = getattr(sec, 'visible', True)
+            sec.visible = not current
+        except Exception:
+            # fallback: toggle children visibility
+            children = list(sec.children)
+            any_visible = any(getattr(c, 'visible', True) for c in children)
+            for c in children:
+                try:
+                    c.visible = not any_visible
+                except Exception:
+                    pass
+            # reflect in sec.visible if supported
+            try:
+                sec.visible = not any_visible
+            except Exception:
+                pass
+
+        # Update button label using a mapping to avoid string parsing
+        titles = {
+            'toggle_optional': 'Opcionales',
+            'toggle_python': 'Python / UI',
+            'toggle_system': 'Sistema'
+        }
+        title = titles.get(btn_id, btn_id)
+        arrow = '▾' if getattr(sec, 'visible', True) else '▸'
+        try:
+            btn.label = f'{arrow} {title}'
+        except Exception:
+            pass
+        # refresh the layout
+        try:
+            sec.refresh()
+            btn.refresh()
+        except Exception:
+            pass
 
     def _run_action(self, action, params):
         if self.running:
@@ -358,24 +461,38 @@ class SimetrioApp(App):
             except Exception:
                 elevate = False
 
-            install_cmd = [sys.executable, script_path('simetrio'), 'deps']
+            # Run installation flow using simetrio module functions, invoked via python -c
             try:
                 install_system = self.query_one('#install_system').value
             except Exception:
                 install_system = False
-            if install_system:
-                install_cmd.append('--install-binaries')
-            install_cmd.append('--install-python')
-            if elevate:
-                install_cmd.append('--elevate')
 
-            self.call_from_thread(self._append_log, f'Running install: {" ".join(install_cmd)}')
-            iproc = subprocess.Popen(install_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in iproc.stdout:
+            # If requested, install system binaries first
+            if install_system:
+                cmd_sys = [sys.executable, '-c', (
+                    "import simetrio,sys; rc=simetrio.install_system_binaries(bins=('multipass','qemu-system-x86_64'), elevate=%s); sys.exit(rc)"
+                    % (str(elevate))) ]
+                self.call_from_thread(self._append_log, f'Running system installer: {" ".join(cmd_sys)}')
+                iproc = subprocess.Popen(cmd_sys, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in iproc.stdout:
+                    self.call_from_thread(self._append_log, line.rstrip())
+                iproc.wait()
+                if iproc.returncode != 0:
+                    self.call_from_thread(self._append_log, f'System installation failed with {iproc.returncode}. Please install manually.')
+                    return
+
+            # Install Python requirements (elevated if requested)
+            if elevate:
+                cmd_py = [sys.executable, '-c', "import simetrio,sys; rc=simetrio.install_python_requirements_elevated(); sys.exit(rc)"]
+            else:
+                cmd_py = [sys.executable, '-c', "import simetrio,sys; rc=simetrio.install_python_requirements(); sys.exit(rc)"]
+            self.call_from_thread(self._append_log, f'Running python installer: {" ".join(cmd_py)}')
+            ppy = subprocess.Popen(cmd_py, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in ppy.stdout:
                 self.call_from_thread(self._append_log, line.rstrip())
-            iproc.wait()
-            if iproc.returncode != 0:
-                self.call_from_thread(self._append_log, f'Installation failed with {iproc.returncode}. Please install manually.')
+            ppy.wait()
+            if ppy.returncode != 0:
+                self.call_from_thread(self._append_log, f'Python installation failed with {ppy.returncode}. Please install manually.')
                 return
 
             # Re-run deps check
@@ -414,11 +531,12 @@ class SimetrioApp(App):
             else:
                 # user confirmed; reset flag and run the installer via simetrio CLI
                 self._pkg_install_pending = False
-                cmd = [sys.executable, script_path('simetrio'), 'deps', '--install-binaries']
-                if elevate:
-                    cmd.append('--elevate')
-                self.call_from_thread(self._append_log, f'Running macOS PKG installer via: {" ".join(cmd)}')
-                iproc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                # Run the install_system_binaries function directly via python -c
+                cmd_sys = [sys.executable, '-c', (
+                    "import simetrio,sys; rc=simetrio.install_system_binaries(bins=('multipass','qemu-system-x86_64'), elevate=%s); sys.exit(rc)"
+                    % (str(elevate)) )]
+                self.call_from_thread(self._append_log, f'Running macOS PKG installer via: {" ".join(cmd_sys)}')
+                iproc = subprocess.Popen(cmd_sys, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 for line in iproc.stdout:
                     self.call_from_thread(self._append_log, line.rstrip())
                 iproc.wait()
@@ -449,11 +567,11 @@ class SimetrioApp(App):
                     elevate = self.query_one('#elevate').value
                 except Exception:
                     elevate = False
-                install_cmd = [sys.executable, script_path('simetrio'), 'deps', '--install-binaries']
-                if elevate:
-                    install_cmd.append('--elevate')
-                self.call_from_thread(self._append_log, f'Running system install: {" ".join(install_cmd)}')
-                iproc = subprocess.Popen(install_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                cmd_sys = [sys.executable, '-c', (
+                    "import simetrio,sys; rc=simetrio.install_system_binaries(bins=('multipass','qemu-system-x86_64'), elevate=%s); sys.exit(rc)"
+                    % (str(elevate)) )]
+                self.call_from_thread(self._append_log, f'Running system install: {" ".join(cmd_sys)}')
+                iproc = subprocess.Popen(cmd_sys, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 for line in iproc.stdout:
                     self.call_from_thread(self._append_log, line.rstrip())
                 iproc.wait()

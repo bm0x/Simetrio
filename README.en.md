@@ -214,6 +214,51 @@ Virtualization & permissions notes
 - On macOS and Windows you usually don't need to run Multipass as root after installation, but the installer/activation may require elevated privileges.
 - If you see permissions or hypervisor backend errors, inspect Multipass logs (`multipass logs <instance>`).
 
+macOS special flow: Homebrew, Caskroom and PKG
+--------------------------------------------
+
+Some Homebrew casks (Multipass included) download an installer .pkg into the Caskroom
+directory (`/usr/local/Caskroom` or `/opt/homebrew/Caskroom`) instead of running the
+system installer automatically. In those cases Multipass may be present as a downloaded
+PKG on disk but the `multipass` binary won't be registered into `/usr/local/bin` until
+the package is installed with the system installer.
+
+What `simetrio` does and how the TUI helps:
+
+- `./simetrio deps` and the TUI detect whether Multipass is missing and search for a PKG
+	file in common Caskroom locations.
+- If a PKG is found, `simetrio` can run the macOS system installer to complete the
+	installation, for example:
+
+```bash
+sudo installer -pkg /usr/local/Caskroom/multipass/<version>/multipass-<version>+mac-Darwin.pkg -target /
+```
+
+- The TUI exposes an "Install system deps" option and requires a double-confirmation
+	before running actions that require admin privileges. If you enable that option and
+	confirm, the TUI will call `simetrio`'s installer functions internally and stream the
+	output into the "Output" pane.
+
+Logs and diagnostics
+--------------------
+
+- All output from `brew`, `installer` and `pip` invoked by `simetrio` is recorded in
+	timestamped logs under:
+
+	- `REPO_ROOT/build/logs/*.log`
+	- or, if the repo directory is not writable, under `~/.cache/simetrio/logs/*.log`
+
+- If an automatic install fails, inspect the `system-install-<timestamp>.log` file to
+	see the full details and the exact `installer` command to run manually.
+
+Security
+--------
+
+- `simetrio` avoids running Homebrew as root. If it detects execution under `sudo`, it
+	attempts to run `brew` as the original user (`sudo -u $SUDO_USER brew ...`). If that
+	isn't possible the tool will inform you and provide the manual command to run.
+
+
 Development notes for contributors
 ----------------------------------
 - Keep the heavy system logic in the existing bash scripts. The Python CLI/TUI should remain a thin orchestration and UX layer.

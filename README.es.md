@@ -163,3 +163,43 @@ Notas de virtualización y permisos
 - Asegúrate de que la virtualización esté habilitada en la BIOS/UEFI en máquinas físicas.
 - En macOS y Windows no suele ser necesario ejecutar Multipass como root después de la instalación, pero el instalador/activación puede requerir permisos elevados.
 - Si encuentras errores relacionados con permisos o con backends hipervisores, revisa los logs de Multipass (`multipass --help` y `multipass logs <instance>`).
+
+Flujo especial en macOS: Homebrew, Caskroom y PKG
+-----------------------------------------------
+
+En macOS algunas casks (como Multipass) descargan un instalador .pkg dentro de la carpeta de Caskroom
+(`/usr/local/Caskroom` o `/opt/homebrew/Caskroom`) en lugar de ejecutar el instalador automáticamente.
+En esos casos, `multipass` puede quedar descargado en disco (el .pkg) pero sin registrar el binario en
+`/usr/local/bin` hasta que se ejecute el instalador del sistema.
+
+Qué hace `simetrio` y la TUI:
+
+- `./simetrio deps` y la TUI detectan si Multipass está ausente y buscan un PKG en las rutas comunes de Caskroom.
+- Si se encuentra un PKG, `simetrio` puede ejecutar de forma segura el comando del sistema para instalarlo:
+
+```bash
+sudo installer -pkg /usr/local/Caskroom/multipass/<version>/multipass-<version>+mac-Darwin.pkg -target /
+```
+
+- La TUI ofrece una opción "Install system deps" y un guard de doble confirmación antes de correr instalaciones
+	que requieran privilegios. Si marcas esa opción y confirmas, la TUI llamará internamente a la función de
+	instalación de `simetrio` y mostrará la salida en la ventana "Output".
+
+Logs y diagnóstico
+-------------------
+
+- Toda la salida de `brew`, `installer` y `pip` invocada desde `simetrio` queda registrada en archivos en:
+
+	- `REPO_ROOT/build/logs/*.log`
+	- o, si el repositorio no es escribible por el usuario actual, en `~/.cache/simetrio/logs/*.log`
+
+- Si la instalación automática falla, consulta el fichero `system-install-<timestamp>.log` para ver el detalle
+	y la línea exacta del `installer` que debes ejecutar manualmente.
+
+Seguridad
+---------
+
+- `simetrio` evita ejecutar Homebrew como root. Si detecta que se está ejecutando bajo `sudo`, intenta correr
+	`brew` como el usuario real (`sudo -u $SUDO_USER brew ...`). Si no es posible, informará y pedirá al usuario
+	que ejecute el comando indicado manualmente.
+
