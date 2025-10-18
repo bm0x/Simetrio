@@ -97,6 +97,10 @@ class SimetrioApp(App):
     """
 
     running = var(False)
+    # require explicit double-confirm for elevated installs
+    _elevate_pending = False
+    # require explicit confirmation before running macOS PKG installer
+    _pkg_install_pending = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -120,6 +124,7 @@ class SimetrioApp(App):
                 yield Checkbox(label="Install Calamares", id="calamares")
                 yield Checkbox(label="Install Python reqs", id="install_python")
                 yield Checkbox(label="Install as admin (sudo)", id="elevate")
+                yield Checkbox(label="Install system deps", id="install_system")
                 yield Button("Run Selected", id="run_selected")
                 yield Button("Copy Log", id="copy_log")
             with Vertical(id="log", classes="panel"):
@@ -173,6 +178,16 @@ class SimetrioApp(App):
                     self._append_log('No action selected. Choose one of the menu buttons first.')
                     return
                 params = self._gather_params()
+                # require explicit confirmation when user requests elevated install
+                if action == 'deps' and ((params.get('install_python') or params.get('install_system')) and params.get('elevate')):
+                    if not self._elevate_pending:
+                        self._elevate_pending = True
+                        self._append_log('You have requested an elevated installation (sudo).')
+                        self._append_log("To confirm, click 'Run Selected' again. This prevents accidental sudo usage.")
+                        return
+                    else:
+                        # confirmed; reset flag and proceed
+                        self._elevate_pending = False
                 self._run_action(action, params)
             except Exception as e:
                 self._append_log(f'Error preparing action: {e}')
@@ -189,12 +204,17 @@ class SimetrioApp(App):
             install_python = self.query_one('#install_python').value
         except Exception:
             install_python = False
+        install_system = False
+        try:
+            install_system = self.query_one('#install_system').value
+        except Exception:
+            install_system = False
         elevate = False
         try:
             elevate = self.query_one('#elevate').value
         except Exception:
             elevate = False
-        return dict(name=name, mem=mem, cpus=cpus, disk=disk, kde=kde, calamares=cal, install_python=install_python, elevate=elevate)
+        return dict(name=name, mem=mem, cpus=cpus, disk=disk, kde=kde, calamares=cal, install_python=install_python, install_system=install_system, elevate=elevate)
 
     def _run_action(self, action, params):
         if self.running:
@@ -228,10 +248,11 @@ class SimetrioApp(App):
                 cmd = [sys.executable, script_path('simetrio'), 'check']
             elif action == 'deps':
                 # run simetrio deps; invoke with sys.executable to avoid permission issues
+                cmd = [sys.executable, script_path('simetrio'), 'deps']
                 if params.get('install_python'):
-                    cmd = [sys.executable, script_path('simetrio'), 'deps', '--install-python']
-                else:
-                    cmd = [sys.executable, script_path('simetrio'), 'deps']
+                    cmd.append('--install-python')
+                if params.get('install_system'):
+                    cmd.append('--install-binaries')
                 if params.get('elevate'):
                     cmd.append('--elevate')
             else:
@@ -323,17 +344,137 @@ class SimetrioApp(App):
             out += line
             self.call_from_thread(self._append_log, line.rstrip())
         proc.wait()
+
         if proc.returncode == 0:
             self.call_from_thread(self._append_log, 'All dependencies satisfied.')
             return
+
         # If missing python packages, offer to install
         if 'Missing Python packages' in out:
-            # prompt user via log & placeholder action
-            self.call_from_thread(self._append_log, 'Missing Python packages detected. Click "Run Selected" to install (set Install KDE/Calamares checkbox as confirm).')
-            # set a flag so run_selected will run install path
-            self._pending_deps_install = True
-        else:
-            self.call_from_thread(self._append_log, 'Some binaries are missing; please install them manually and re-run.')
+            self.call_from_thread(self._append_log, 'Missing Python packages detected. Attempting to install automatically...')
+            # Determine if user requested elevation in the UI
+            try:
+                elevate = self.query_one('#elevate').value
+            except Exception:
+                elevate = False
+
+            install_cmd = [sys.executable, script_path('simetrio'), 'deps']
+            try:
+                install_system = self.query_one('#install_system').value
+            except Exception:
+                install_system = False
+            if install_system:
+                install_cmd.append('--install-binaries')
+            install_cmd.append('--install-python')
+            if elevate:
+                install_cmd.append('--elevate')
+
+            self.call_from_thread(self._append_log, f'Running install: {" ".join(install_cmd)}')
+            iproc = subprocess.Popen(install_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in iproc.stdout:
+                self.call_from_thread(self._append_log, line.rstrip())
+            iproc.wait()
+            if iproc.returncode != 0:
+                self.call_from_thread(self._append_log, f'Installation failed with {iproc.returncode}. Please install manually.')
+                return
+
+            # Re-run deps check
+            self.call_from_thread(self._append_log, 'Re-checking dependencies after install...')
+            rproc = subprocess.Popen([sys.executable, script_path('simetrio'), 'deps'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in rproc.stdout:
+                self.call_from_thread(self._append_log, line.rstrip())
+            rproc.wait()
+            if rproc.returncode == 0:
+                self.call_from_thread(self._append_log, 'Dependencies satisfied after installation.')
+            else:
+                self.call_from_thread(self._append_log, 'Dependencies remain missing after installation; please inspect output and install required system packages.')
+            return
+
+        # Detect if the CLI found a Multipass PKG and suggested manual installer step
+        if 'Found Multipass PKG' in out or 'Multipass PKG present' in out:
+            self.call_from_thread(self._append_log, 'Detected a downloaded Multipass PKG on macOS. This requires running the system installer to complete.')
+            try:
+                install_system = self.query_one('#install_system').value
+            except Exception:
+                install_system = False
+            try:
+                elevate = self.query_one('#elevate').value
+            except Exception:
+                elevate = False
+
+            if not install_system:
+                self.call_from_thread(self._append_log, 'Enable "Install system deps" in the options to allow the TUI to run the PKG installer.')
+                return
+
+            # require explicit double-confirmation to actually run the system installer
+            if not self._pkg_install_pending:
+                self._pkg_install_pending = True
+                self.call_from_thread(self._append_log, 'To run the macOS PKG installer (requires admin) click "Run Selected" again to confirm.')
+                return
+            else:
+                # user confirmed; reset flag and run the installer via simetrio CLI
+                self._pkg_install_pending = False
+                cmd = [sys.executable, script_path('simetrio'), 'deps', '--install-binaries']
+                if elevate:
+                    cmd.append('--elevate')
+                self.call_from_thread(self._append_log, f'Running macOS PKG installer via: {" ".join(cmd)}')
+                iproc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in iproc.stdout:
+                    self.call_from_thread(self._append_log, line.rstrip())
+                iproc.wait()
+                if iproc.returncode != 0:
+                    self.call_from_thread(self._append_log, f'PKG installer run failed with {iproc.returncode}. Check logs in build/logs or ~/.cache/simetrio/logs')
+                    return
+                # re-run deps to confirm
+                self.call_from_thread(self._append_log, 'Re-checking dependencies after PKG installer...')
+                rproc = subprocess.Popen([sys.executable, script_path('simetrio'), 'deps'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in rproc.stdout:
+                    self.call_from_thread(self._append_log, line.rstrip())
+                rproc.wait()
+                if rproc.returncode == 0:
+                    self.call_from_thread(self._append_log, 'Dependencies satisfied after PKG installation.')
+                else:
+                    self.call_from_thread(self._append_log, 'Dependencies still missing after PKG installation; please inspect the logs and run manual steps if needed.')
+                return
+
+        # If binaries are missing and the user requested system install, attempt it
+        if 'Missing binaries' in out:
+            try:
+                install_system = self.query_one('#install_system').value
+            except Exception:
+                install_system = False
+            if install_system:
+                self.call_from_thread(self._append_log, 'Attempting to install missing system binaries...')
+                try:
+                    elevate = self.query_one('#elevate').value
+                except Exception:
+                    elevate = False
+                install_cmd = [sys.executable, script_path('simetrio'), 'deps', '--install-binaries']
+                if elevate:
+                    install_cmd.append('--elevate')
+                self.call_from_thread(self._append_log, f'Running system install: {" ".join(install_cmd)}')
+                iproc = subprocess.Popen(install_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in iproc.stdout:
+                    self.call_from_thread(self._append_log, line.rstrip())
+                iproc.wait()
+                if iproc.returncode != 0:
+                    self.call_from_thread(self._append_log, f'System installation failed with {iproc.returncode}. Please install manually.')
+                    return
+
+                # Re-run deps check after system install
+                self.call_from_thread(self._append_log, 'Re-checking dependencies after system install...')
+                rproc = subprocess.Popen([sys.executable, script_path('simetrio'), 'deps'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in rproc.stdout:
+                    self.call_from_thread(self._append_log, line.rstrip())
+                rproc.wait()
+                if rproc.returncode == 0:
+                    self.call_from_thread(self._append_log, 'Dependencies satisfied after system installation.')
+                else:
+                    self.call_from_thread(self._append_log, 'Dependencies remain missing after system installation; please inspect output and install required system packages.')
+                return
+
+        # Fallback message
+        self.call_from_thread(self._append_log, 'Some binaries are missing; please install them manually and re-run.')
 
     # Note: deps flow is started in the primary on_button_pressed handler above.
 

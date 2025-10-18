@@ -23,6 +23,7 @@ import os
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime
 
 def find_repo_root():
     p = Path(__file__).resolve()
@@ -33,6 +34,26 @@ def find_repo_root():
             return cur
         cur = cur.parent
     return p.parent
+
+
+def get_log_dir():
+    """Return a writable log directory. Prefer REPO_ROOT/build/logs, but if it's not writable
+    (e.g., owned by root) fall back to the user's cache directory under $HOME/.cache/simetrio/logs.
+    """
+    preferred = REPO_ROOT / 'build' / 'logs'
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        # test writability
+        testfile = preferred / '.simetrio_write_test'
+        with open(testfile, 'w') as f:
+            f.write('ok')
+        testfile.unlink()
+        return preferred
+    except Exception:
+        # fallback to user cache
+        fallback = Path.home() / '.cache' / 'simetrio' / 'logs'
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 REPO_ROOT = find_repo_root()
@@ -107,8 +128,27 @@ def install_python_requirements(req_path=None):
     if not reqf or not reqf.exists():
         print('No requirements file found to install.')
         return 1
+    # If we're not inside a virtualenv, prefer installing to user site to avoid
+    # requiring root. If running inside a venv, install into the active env.
+    in_venv = (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix))
     cmd = [sys.executable, '-m', 'pip', 'install', '-r', str(reqf)]
-    return run_cmd(cmd, cwd=REPO_ROOT, stream=True)
+    if not in_venv:
+        # use --user to avoid system-wide installs by default
+        cmd.insert(4, '--user')
+
+    # Ensure log directory exists and capture pip output to a timestamped log
+    logdir = get_log_dir()
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%SZ')
+    logfile = logdir / f'pip-install-{ts}.log'
+    print(f'Logging pip output to: {logfile}')
+
+    p = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    with open(logfile, 'w', encoding='utf-8') as lf:
+        for line in p.stdout:
+            print(line, end='')
+            lf.write(line)
+    rc = p.wait()
+    return rc
 
 
 def install_python_requirements_elevated(req_path=None):
@@ -128,9 +168,29 @@ def install_python_requirements_elevated(req_path=None):
         print('Elevated installation on Windows is not automated. Please open an Administrator PowerShell and run:')
         print(f"{sys.executable} -m pip install -r {reqf}")
         return 2
-    # POSIX: prefix with sudo
+    # If we're inside a virtualenv, elevated install is not required and may be
+    # harmful (it would attempt to modify system interpreters). In that case
+    # fall back to normal install into the venv.
+    in_venv = (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix))
+    if in_venv:
+        print('Running inside a virtualenv — performing install into the active environment rather than using sudo.')
+        return install_python_requirements(req_path=req_path)
+    # POSIX: prefix with sudo for system-wide install
     cmd = ['sudo', sys.executable, '-m', 'pip', 'install', '-r', str(reqf)]
-    return run_cmd(cmd, cwd=REPO_ROOT, stream=True)
+
+    # Ensure log directory exists and capture pip output to a timestamped log
+    logdir = get_log_dir()
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%SZ')
+    logfile = logdir / f'pip-install-{ts}-elevated.log'
+    print(f'Logging elevated pip output to: {logfile}')
+
+    p = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    with open(logfile, 'w', encoding='utf-8') as lf:
+        for line in p.stdout:
+            print(line, end='')
+            lf.write(line)
+    rc = p.wait()
+    return rc
 
 
 def check_scripts_syntax():
@@ -148,6 +208,162 @@ def check_scripts_syntax():
             print(f"Syntax error in {path}")
             ok = False
     return ok
+
+
+def install_system_binaries(bins=('multipass','qemu-system-x86_64'), elevate=False):
+    """Attempt to install missing system binaries for common platforms.
+    This is best-effort: it will try Homebrew on macOS, snap/apt on Debian/Ubuntu,
+    and Chocolatey on Windows. Returns 0 on success, non-zero otherwise.
+    """
+    missing = [b for b in bins if which_bin(b) is None]
+    if not missing:
+        print('No system binaries to install.')
+        return 0
+
+    logdir = get_log_dir()
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%SZ')
+    logfile = logdir / f'system-install-{ts}.log'
+    print(f'Attempting to install system binaries: {missing}. Logging to {logfile}')
+
+    overall_rc = 0
+    with open(logfile, 'w', encoding='utf-8') as lf:
+        for b in missing:
+            if sys.platform.startswith('darwin'):
+                if b == 'multipass':
+                    cmd = ['brew', 'install', '--cask', 'multipass']
+                elif 'qemu' in b:
+                    cmd = ['brew', 'install', 'qemu']
+                else:
+                    lf.write(f'No automated installer for {b} on macOS\n')
+                    overall_rc = overall_rc or 2
+                    continue
+            elif sys.platform.startswith('linux'):
+                # Prefer snap for multipass; fall back to apt for qemu
+                if b == 'multipass':
+                    if shutil.which('snap'):
+                        cmd = ['snap', 'install', 'multipass', '--classic']
+                        if elevate and os.name != 'nt':
+                            cmd.insert(0, 'sudo')
+                    else:
+                        # attempt apt
+                        cmd = ['apt', 'update']
+                elif 'qemu' in b:
+                    cmd = ['apt', 'install', '-y', 'qemu-system']
+                    if elevate and os.name != 'nt':
+                        cmd.insert(0, 'sudo')
+                else:
+                    lf.write(f'No automated installer for {b} on Linux\n')
+                    overall_rc = overall_rc or 2
+                    continue
+            elif os.name == 'nt':
+                # Windows: try Chocolatey
+                if shutil.which('choco'):
+                    if b == 'multipass':
+                        cmd = ['choco', 'install', '-y', 'multipass']
+                    elif 'qemu' in b:
+                        cmd = ['choco', 'install', '-y', 'qemu']
+                    else:
+                        lf.write(f'No automated installer for {b} on Windows\n')
+                        overall_rc = overall_rc or 2
+                        continue
+                else:
+                    lf.write('Chocolatey not found; cannot auto-install on Windows\n')
+                    overall_rc = overall_rc or 2
+                    continue
+            else:
+                lf.write(f'Unsupported platform for automated install: {sys.platform}\n')
+                overall_rc = overall_rc or 2
+                continue
+
+            # Run the install command and capture output
+            lf.write(f'Running: {cmd}\n')
+            # Safety: do not run Homebrew as root — skip and inform user
+            try:
+                if sys.platform.startswith('darwin') and cmd and cmd[0] == 'brew' and hasattr(os, 'geteuid') and os.geteuid() == 0:
+                    # If running under sudo, prefer to run brew as the original user
+                    sudo_user = os.environ.get('SUDO_USER')
+                    if sudo_user:
+                        # run brew as the original user to avoid Homebrew root error
+                        run_as = ['sudo', '-u', sudo_user]
+                        lf.write(f'Running brew as user {sudo_user} via: {run_as + cmd}\n')
+                        cmd = run_as + cmd
+                    else:
+                        msg = ('Refusing to run Homebrew as root. Please run the following command as your regular user (without sudo):\n'
+                               + '    ' + ' '.join(cmd) + '\n')
+                        print(msg)
+                        lf.write(msg + '\n')
+                        overall_rc = overall_rc or 1
+                        continue
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in p.stdout:
+                    print(line, end='')
+                    lf.write(line)
+                rc = p.wait()
+                if rc != 0:
+                    lf.write(f'Command {cmd} exited with {rc}\n')
+                    overall_rc = overall_rc or rc or 4
+            except FileNotFoundError:
+                lf.write(f'Installer command not found for: {cmd[0]}\n')
+                overall_rc = overall_rc or 2
+        # Special-case: Homebrew may download a Multipass PKG into Caskroom
+        # (e.g. /usr/local/Caskroom/multipass/<version>/multipass-<ver>+mac-Darwin.pkg)
+        # but not run the system installer. If multipass is still missing and
+        # we find a PKG, offer to run the macOS `installer` tool when elevated.
+        if sys.platform.startswith('darwin') and 'multipass' in missing and which_bin('multipass') is None:
+            # Search common Homebrew Caskroom locations
+            cask_paths = [Path('/usr/local/Caskroom'), Path('/opt/homebrew/Caskroom'), Path('/usr/local/Caskroom/multipass')]
+            found_pkg = None
+            for base in cask_paths:
+                if not base.exists():
+                    continue
+                # look for any .pkg file under multipass folder
+                for p in base.rglob('*.pkg'):
+                    # heuristics: contain 'multipass' in filename or be inside multipass folder
+                    if 'multipass' in p.name.lower() or 'multipass' in str(p.parent).lower():
+                        found_pkg = p
+                        break
+                if found_pkg:
+                    break
+
+            if found_pkg:
+                lf.write(f'Found Multipass PKG at {found_pkg}\n')
+                print(f'Found Multipass PKG at: {found_pkg}')
+                # Only attempt to run the system installer if we have elevation
+                have_elevation = False
+                try:
+                    have_elevation = (hasattr(os, 'geteuid') and os.geteuid() == 0) or bool(elevate)
+                except Exception:
+                    have_elevation = bool(elevate)
+
+                installer_cmd = ['installer', '-pkg', str(found_pkg), '-target', '/']
+                if have_elevation and os.name != 'nt':
+                    # If not running as root but user requested elevate, prefix with sudo
+                    if not (hasattr(os, 'geteuid') and os.geteuid() == 0) and bool(elevate):
+                        installer_cmd = ['sudo'] + installer_cmd
+                    lf.write(f'Running system installer: {installer_cmd}\n')
+                    try:
+                        p2 = subprocess.Popen(installer_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                        for line in p2.stdout:
+                            print(line, end='')
+                            lf.write(line)
+                        rc2 = p2.wait()
+                        if rc2 != 0:
+                            lf.write(f'installer exited with {rc2}\n')
+                            overall_rc = overall_rc or rc2 or 8
+                        else:
+                            lf.write('installer completed successfully\n')
+                    except FileNotFoundError:
+                        msg = 'macOS installer tool not found; cannot run PKG installer programmatically.'
+                        print(msg)
+                        lf.write(msg + '\n')
+                        overall_rc = overall_rc or 2
+                else:
+                    msg = (f'Multipass PKG present at {found_pkg}. To complete the installation run as an administrator:\n'
+                           f'    sudo installer -pkg {found_pkg} -target /\n')
+                    print(msg)
+                    lf.write(msg + '\n')
+                    overall_rc = overall_rc or 1
+    return overall_rc
 
 
 def preflight_checks():
@@ -252,8 +468,26 @@ def cmd_deps(args):
     missing_bins = [b for b in ('multipass','qemu-system-x86_64','python3') if which_bin(b) is None]
     if missing_bins:
         print('Missing binaries: ' + ', '.join(missing_bins))
+        # Provide brief platform-specific hints
+        if sys.platform.startswith('darwin'):
+            print('On macOS you can install Multipass via Homebrew: brew install --cask multipass')
+        elif sys.platform.startswith('linux'):
+            print('On Linux, follow distro instructions; on Ubuntu: sudo snap install multipass --classic')
+        elif os.name == 'nt':
+            print('On Windows: download Multipass from https://multipass.run or use Chocolatey: choco install multipass')
     else:
         print('All required binaries present.')
+
+    # If requested, attempt to auto-install missing system binaries
+    if getattr(args, 'install_binaries', False):
+        print('Attempting to install missing system binaries...')
+        rc_sys = install_system_binaries(bins=missing_bins, elevate=getattr(args, 'elevate', False))
+        if rc_sys != 0:
+            print('System package installation reported issues (see logs).')
+        # after attempting installation, recompute missing bins
+        missing_bins = [b for b in ('multipass','qemu-system-x86_64','python3') if which_bin(b) is None]
+        if not missing_bins:
+            print('System binaries installed successfully.')
 
     missing_pkgs = check_python_requirements()
     if missing_pkgs:
@@ -264,11 +498,23 @@ def cmd_deps(args):
                 rc = install_python_requirements_elevated()
             else:
                 rc = install_python_requirements()
-            return rc
+            if rc != 0:
+                print('Installation returned non-zero exit code:', rc)
+                return 3
+            # re-check after install
+            missing_after = check_python_requirements()
+            if missing_after:
+                print('After installation, still missing packages: ' + ', '.join(missing_after))
+                return 3
+            print('Python requirements installed and verified.')
+            # If binaries were missing earlier, report that via exit code 1
+            return (1 if missing_bins else 0)
+        # don't auto-install unless requested
         return 2
     else:
         print('Python requirements satisfied.')
-    return 0
+    # Return 1 if binaries missing, else success
+    return (1 if missing_bins else 0)
 
 
 def main(argv=None):
@@ -399,6 +645,7 @@ def main(argv=None):
     sub.add_parser('check', help='Run preflight checks (binaries + script syntax)')
     p_deps = sub.add_parser('deps', help='Check dependencies and optionally install Python requirements')
     p_deps.add_argument('--install-python', action='store_true', help='Install python requirements from requirements-simetrio.txt')
+    p_deps.add_argument('--install-binaries', action='store_true', help='Attempt to install missing system binaries (multipass, qemu). May require sudo')
     p_deps.add_argument('--elevate', action='store_true', help='Attempt to run pip install with elevated privileges (uses sudo on POSIX)')
 
     args = parser.parse_args(argv)
